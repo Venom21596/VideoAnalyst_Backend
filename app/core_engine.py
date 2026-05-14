@@ -9,8 +9,12 @@ import subprocess
 import requests
 import base64
 from typing import Dict, Any, List
+import subprocess
+import requests
+import base64
+from concurrent.futures import ThreadPoolExecutor
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO) 
 logger = logging.getLogger(__name__)
 
 print("Loading AI models...")
@@ -19,16 +23,32 @@ whisper_model = whisper.load_model("base")
 print("Models ready.")
 
 def has_audio(video_path: str) -> bool:
-    """Check if video has an audio track."""
+    """
+    Check whether the video contains meaningful audio.
+    Returns False for silent/empty audio tracks.
+    """
+
     cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a",
-        "-show_entries", "stream=codec_type",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path
+        "ffmpeg",
+        "-i", video_path,
+        "-af", "volumedetect",
+        "-f", "null",
+        "NUL"
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return "audio" in result.stdout
+
+    result = subprocess.run(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True
+    )
+
+    output = result.stderr
+
+    if "mean_volume: -91.0 dB" in output:
+        return False
+
+    return "Audio:" in output
 
 def get_video_duration(video_path: str) -> float:
     """Get video duration in seconds."""
@@ -43,6 +63,26 @@ def get_video_duration(video_path: str) -> float:
         return float(result.stdout.strip())
     except:
         return 0.0
+def extract_audio(video_path: str):
+    audio_path = "data/temp_audio.wav"  
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        audio_path
+    ]
+
+    subprocess.run(
+        cmd,
+        capture_output=True
+    )
+
+    return audio_path
 
 def extract_frames(video_path: str, interval_seconds: int = 5) -> List[Dict]:
     """Extract frames from video at regular intervals using FFmpeg."""
@@ -71,31 +111,62 @@ def extract_frames(video_path: str, interval_seconds: int = 5) -> List[Dict]:
     return frames
 
 def describe_frame_with_llava(frame_path: str) -> str:
-    """Use LLaVA to describe what's happening in a video frame."""
+    """Use LLaVA to describe video frames."""
+
     with open(frame_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
+        image_data = base64.b64encode(
+            f.read()
+        ).decode("utf-8")
 
     try:
+
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "moondream",
-                "prompt": "Describe what is happening in this video frame in 1-2 sentences. Focus on actions, text visible, people, objects, and any important visual information.",
+                "model": "llava",
+                "prompt": """
+Describe only what is directly visible.
+
+Rules:
+- Do not guess
+- Do not infer story
+- Do not infer emotions
+- Do not assume object purpose
+- Mention only visible characters
+- Mention visible objects
+- Mention visible actions
+- Mention visible text
+
+Maximum 2 sentences.
+""",
                 "images": [image_data],
                 "stream": False
             },
             timeout=60
         )
+
         response.raise_for_status()
-        return response.json()['response']
+
+        return response.json()["response"]
+
     except Exception as e:
-        logger.error(f"LLaVA error: {e}")
+
+        logger.error(
+            f"LLaVA error: {e}"
+        )
+
         return "Frame could not be described."
 
 def transcribe_silent_video(video_path: str) -> List[Dict]:
     """For silent videos — extract frames and describe each with LLaVA."""
     logger.info("No audio detected. Using LLaVA visual analysis...")
-    frames = extract_frames(video_path, interval_seconds=5)
+    duration = get_video_duration(video_path)
+    interval = 2 if duration < 120 else 5
+
+    frames = extract_frames(
+        video_path,
+        interval_seconds=interval
+    )   
     segments = []
 
     for frame in frames:
@@ -110,29 +181,92 @@ def transcribe_silent_video(video_path: str) -> List[Dict]:
     return segments
 
 def process_video(video_path: str) -> Dict[str, Any]:
+
     if not os.path.exists(video_path):
-        raise FileNotFoundError(f"File not found: {video_path}")
+        raise FileNotFoundError(
+            f"File not found: {video_path}"
+        )
 
-    # Scene detection (works for all videos)
-    logger.info("Detecting scenes...")
-    scene_list = detect(video_path, ContentDetector())
-    chapters = [scene[0].get_seconds() for scene in scene_list]
+    logger.info("Processing video...")
 
-    # Check for audio
     if has_audio(video_path):
-        logger.info("Audio detected. Transcribing with Whisper...")
-        result = whisper_model.transcribe(video_path)
-        segments = result['segments']
-    else:
-        logger.info("No audio. Analysing frames with LLaVA...")
-        segments = transcribe_silent_video(video_path)
 
-    # Build FAISS index
-    logger.info("Building search index...")
-    texts = [s['text'] for s in segments]
-    embeddings = embed_model.encode(texts).astype('float32')
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
+        logger.info(
+            "Audio detected. Transcribing with Whisper..."
+        )
+
+        audio_path = extract_audio(video_path)
+
+        with ThreadPoolExecutor(
+            max_workers=2
+        ) as executor:
+
+            scene_future = executor.submit(
+                detect,
+                video_path,
+                ContentDetector()
+            )
+
+            transcribe_future = executor.submit(
+                whisper_model.transcribe,
+                audio_path,
+                fp16=False,
+                verbose=False,
+                condition_on_previous_text=False
+            )
+
+            scene_list = scene_future.result()
+
+            result = transcribe_future.result()
+
+            segments = result["segments"]
+
+    else:
+
+        logger.info(
+            "No audio. Analysing frames with LLaVA..."
+        )
+
+        scene_list = detect(
+            video_path,
+            ContentDetector()
+        )
+
+        segments = transcribe_silent_video(
+            video_path
+        )
+
+    chapters = [
+        scene[0].get_seconds()
+        for scene in scene_list
+    ]
+
+    logger.info(
+        "Building search index..."
+    )
+
+    texts = [
+        s["text"]
+        for s in segments
+        if s.get("text")
+    ]
+
+    if not texts:
+        raise ValueError(
+            "No transcript or visual descriptions generated."
+        )
+
+    embeddings = embed_model.encode(
+        texts
+    ).astype("float32")
+
+    index = faiss.IndexFlatL2(
+        embeddings.shape[1]
+    )
+
+    index.add(
+        embeddings
+    )
 
     return {
         "index": index,
