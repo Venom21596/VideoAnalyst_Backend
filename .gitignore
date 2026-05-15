@@ -18,3 +18,8 @@ data/temp_audio.wav
 # OS
 .DS_Store
 Thumbs.db
+venv/
+__pycache__/
+*.pyc
+data/clips/
+data/uploads/
